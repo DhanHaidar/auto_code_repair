@@ -46,11 +46,10 @@ class MCTS:
         self.max_refine_attempts = max(0, int(max_refine_attempts))
 
     def search(self, iterations: int) -> None:
-        """Run MCTS search for a number of iterations."""
         self.run(iterations)
 
     def run(self, iterations: int) -> None:
-        """Run the main MCTS loop for a number of iterations."""
+
         if self.parallelism <= 1:
             for iteration in range(1, iterations + 1):
                 leaf = self.select(self.root)
@@ -83,20 +82,20 @@ class MCTS:
                     break
 
     def select(self, node: Node) -> Node:
-        """Select a node to expand based on a policy."""
+        
         current = node
         while not current.is_leaf():
             current = self._best_uct_child(current)
         return current
 
     def expand(self, node: Node) -> Node:
-        """Expand the given node by adding a child."""
+        
         child = Node(state=node.state)
         node.add_child(child)
         return child
 
     def simulate(self, node: Node) -> SimulationResult:
-        """Simulate a rollout from the node and return a result."""
+        
         if self.generator is None:
             return SimulationResult(patch=None, reward=0.0, status="SKIP", output="")
 
@@ -152,7 +151,7 @@ class MCTS:
         )
 
     def backpropagate(self, node: Node, reward: float) -> None:
-        """Backpropagate the simulation reward up the tree."""
+        
         current: Optional[Node] = node
         while current is not None:
             current.update(reward)
