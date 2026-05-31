@@ -16,6 +16,7 @@ from ape_prompt_optimizer import (
     PromptOptimizer,
     PromptSignature,
 )
+from batch_repair import BatchRepairRunner
 from core.mcts import MCTS
 from core.node import Node
 from evaluator.tester import Tester
@@ -45,15 +46,57 @@ def _resolve_model_name(model_name: str, preset: str) -> str:
     return model_name
 
 
+def _optimize_instruction_from_dataset(
+    generator: LLMGenerator,
+    dataset,
+    initial_instruction: str,
+    optimizer_model: str,
+    iterations: int,
+    min_score: float,
+    few_shot_k: int,
+) -> str:
+    if not dataset:
+        return initial_instruction
+
+    selector = ExampleSelector(max_examples=few_shot_k)
+    prompt_signature = PromptSignature(template=APE_TEMPLATE)
+    coder = LLMGeneratorAdapter(generator)
+    evaluator = Evaluator(
+        coder=coder,
+        prompt_signature=prompt_signature,
+        example_selector=selector,
+    )
+
+    optimizer_client = None
+    optimizer_model = optimizer_model.strip()
+    if optimizer_model:
+        optimizer_client = OpenAIInstructionClient(model=optimizer_model)
+    optimizer = PromptOptimizer(optimizer_client)
+
+    pipeline = PromptOptimizationPipeline(
+        evaluator=evaluator,
+        optimizer=optimizer,
+        min_score=min_score,
+    )
+
+    result = pipeline.optimize_pipeline(
+        dataset=dataset,
+        initial_instruction=initial_instruction,
+        iterations=iterations,
+        few_shot_k=few_shot_k,
+    )
+    return result.best_instruction
+
+
 def main() -> None:
     """Entry point for the APR tool."""
     parser = argparse.ArgumentParser(description="APR tool with MCTS + LLM")
-    parser.add_argument("--code", required=True, help="Path to buggy code file")
+    parser.add_argument("--code", default="", help="Path to buggy code file")
     parser.add_argument(
         "--test",
         "--tests",
         dest="tests",
-        required=True,
+        default="",
         help="Path to pytest tests",
     )
     parser.add_argument("--iterations", type=int, default=10)
@@ -84,6 +127,22 @@ def main() -> None:
         "--ape-dataset",
         default="",
         help="Path to JSON dataset for prompt optimization",
+    )
+    parser.add_argument(
+        "--batch-dataset",
+        default="",
+        help="Path to a QuixBugs-style dataset JSON for batch repair generation",
+    )
+    parser.add_argument(
+        "--batch-output-dir",
+        default="",
+        help="Directory where generated repair candidates and manifest will be written",
+    )
+    parser.add_argument(
+        "--batch-workers",
+        type=int,
+        default=0,
+        help="Number of parallel workers for batch repair generation",
     )
     parser.add_argument("--ape-iterations", type=int, default=2)
     parser.add_argument("--ape-min-score", type=float, default=1.0)
@@ -117,21 +176,15 @@ def main() -> None:
         format="%(asctime)s | %(levelname)s | %(message)s",
     )
 
-    code_path = Path(args.code)
-    if not code_path.exists():
-        raise SystemExit(f"Code file not found: {code_path}")
-    buggy_code = code_path.read_text(encoding="utf-8")
+    instruction_file = (
+        Path(args.ape_instruction_file).expanduser()
+        if args.ape_instruction_file.strip()
+        else None
+    )
+    cached_instruction = None
+    if instruction_file and instruction_file.exists():
+        cached_instruction = instruction_file.read_text(encoding="utf-8").strip() or None
 
-    tests_path = Path(args.tests)
-    if not tests_path.exists():
-        raise SystemExit(f"Test file/path not found: {tests_path}")
-
-    module_name = args.module_name.strip() or code_path.stem
-    package_name = args.package_name.strip() or None
-    if package_name is None and code_path.parent.name == "python_programs":
-        package_name = "python_programs"
-
-    root = Node(state=buggy_code)
     hf_device = args.hf_device
     if hf_device is None:
         hf_device = _detect_transformers_device()
@@ -150,19 +203,78 @@ def main() -> None:
         transformers_device=hf_device,
         openrouter_max_tokens=args.openrouter_max_tokens,
     )
+
+    instruction_override = args.ape_instruction.strip() or cached_instruction or DEFAULT_INSTRUCTION
+    ape_examples = []
+
+    if args.ape_dataset:
+        dataset_path = Path(args.ape_dataset)
+        if not dataset_path.exists():
+            raise SystemExit(f"APE dataset not found: {dataset_path}")
+
+        ape_examples = DatasetLoader().load_from_json(str(dataset_path))
+        try:
+            instruction_override = _optimize_instruction_from_dataset(
+                generator=generator,
+                dataset=ape_examples,
+                initial_instruction=instruction_override,
+                optimizer_model=args.ape_optimizer_model,
+                iterations=args.ape_iterations,
+                min_score=args.ape_min_score,
+                few_shot_k=args.ape_few_shot_k,
+            )
+            if instruction_file:
+                instruction_file.write_text(instruction_override, encoding="utf-8")
+            logging.info("APE best instruction optimized from %d examples", len(ape_examples))
+        except Exception as exc:
+            logging.warning("APE optimization skipped: %s", exc)
+
+    if args.batch_dataset.strip():
+        if not args.batch_output_dir.strip():
+            raise SystemExit("--batch-output-dir is required when --batch-dataset is set")
+
+        if args.batch_workers < 0:
+            raise SystemExit("--batch-workers must be >= 0")
+
+        batch_runner = BatchRepairRunner(
+            generator=generator,
+            instruction_override=instruction_override,
+            default_package_name=args.package_name.strip() or "python_programs",
+            ape_examples=ape_examples,
+            ape_few_shot_k=args.ape_few_shot_k,
+            mcts_iterations=args.iterations,
+            mcts_parallelism=args.parallel,
+            stop_on_pass=args.early_stop,
+            max_refine_attempts=args.refine_attempts,
+            workers=args.batch_workers,
+        )
+        summary = batch_runner.run_from_json(args.batch_dataset, args.batch_output_dir)
+        print("Batch repair completed.")
+        print(f"- total: {summary.total}")
+        print(f"- output_dir: {summary.output_dir}")
+        print(f"- manifest_path: {summary.manifest_path}")
+        print(f"- generated_count: {summary.generated_count}")
+        print(f"- error_count: {summary.error_count}")
+        return
+
+    code_path = Path(args.code)
+    if not code_path.exists():
+        raise SystemExit(f"Code file not found: {code_path}")
+    buggy_code = code_path.read_text(encoding="utf-8")
+
+    tests_path = Path(args.tests)
+    if not tests_path.exists():
+        raise SystemExit(f"Test file/path not found: {tests_path}")
+
+    module_name = args.module_name.strip() or code_path.stem
+    package_name = args.package_name.strip() or None
+    if package_name is None and code_path.parent.name == "python_programs":
+        package_name = "python_programs"
+
+    root = Node(state=buggy_code)
     tester = Tester(args.tests, module_name=module_name, package_name=package_name)
     db = Database(args.storage)
 
-    instruction_override = None
-    few_shot_examples = ""
-    instruction_file = (
-        Path(args.ape_instruction_file).expanduser()
-        if args.ape_instruction_file.strip()
-        else None
-    )
-    cached_instruction = None
-    if instruction_file and instruction_file.exists():
-        cached_instruction = instruction_file.read_text(encoding="utf-8").strip() or None
     bug_description = args.bug_description.strip()
     if not bug_description:
         _, _, initial_output = tester.run_with_details(buggy_code)
@@ -170,77 +282,21 @@ def main() -> None:
             bug_description = initial_output
     error_message = bug_description
 
-    if args.ape_dataset:
-        dataset_path = Path(args.ape_dataset)
-        if not dataset_path.exists():
-            raise SystemExit(f"APE dataset not found: {dataset_path}")
-
-        dataset = DatasetLoader().load_from_json(str(dataset_path))
-        if dataset:
-            selector = ExampleSelector(max_examples=args.ape_few_shot_k)
-            prompt_signature = PromptSignature(template=APE_TEMPLATE)
-            coder = LLMGeneratorAdapter(generator)
-            evaluator = Evaluator(
-                coder=coder,
-                prompt_signature=prompt_signature,
-                example_selector=selector,
-            )
-
-            optimizer_client = None
-            optimizer_model = args.ape_optimizer_model.strip()
-            if optimizer_model:
-                optimizer_client = OpenAIInstructionClient(model=optimizer_model)
-            optimizer = PromptOptimizer(optimizer_client)
-
-            pipeline = PromptOptimizationPipeline(
-                evaluator=evaluator,
-                optimizer=optimizer,
-                min_score=args.ape_min_score,
-            )
-
-            initial_instruction = (
-                args.ape_instruction.strip()
-                or cached_instruction
-                or DEFAULT_INSTRUCTION
-            )
-            try:
-                result = pipeline.optimize_pipeline(
-                    dataset=dataset,
-                    initial_instruction=initial_instruction,
-                    iterations=args.ape_iterations,
-                    few_shot_k=args.ape_few_shot_k,
-                )
-                instruction_override = result.best_instruction
-                if instruction_file:
-                    instruction_file.write_text(
-                        result.best_instruction, encoding="utf-8"
-                    )
-
-                query_example = BugExample(
-                    buggy_code=buggy_code,
-                    error_message=error_message,
-                    correct_code="",
-                )
-                selected = selector.select_examples(
-                    query_example, dataset, k=args.ape_few_shot_k
-                )
-                few_shot_examples = selector.format_examples(selected)
-                logging.info("APE best score: %.2f", result.best_score)
-            except Exception as exc:
-                logging.warning("APE optimization skipped: %s", exc)
-                if cached_instruction:
-                    instruction_override = cached_instruction
-                elif args.ape_instruction.strip():
-                    instruction_override = args.ape_instruction.strip()
-
-    if not args.ape_dataset:
-        if args.ape_instruction.strip():
-            instruction_override = args.ape_instruction.strip()
-        elif cached_instruction:
-            instruction_override = cached_instruction
-
     total_iterations = 0
     pass_count = 0
+
+    few_shot_examples = ""
+    if ape_examples:
+        selector = ExampleSelector(max_examples=args.ape_few_shot_k)
+        query_example = BugExample(
+            buggy_code=buggy_code,
+            error_message=error_message,
+            correct_code="",
+        )
+        selected = selector.select_examples(
+            query_example, ape_examples, k=args.ape_few_shot_k
+        )
+        few_shot_examples = selector.format_examples(selected)
 
     def _generate(code: str) -> str:
         return generator.generate(
